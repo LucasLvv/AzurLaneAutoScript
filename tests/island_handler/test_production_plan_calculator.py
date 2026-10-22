@@ -4,15 +4,30 @@ Run with (pytest is not a repo dependency, install it yourself):
     pixi run python -m pytest tests/ -v
 """
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 from yaml import safe_load
 
 import module.config.server as server
-from module.island.data import DIC_ISLAND_ACTIVITY, DIC_ISLAND_SEASON
+from module.island.data import DIC_ISLAND_ACTIVITY, DIC_ISLAND_ITEM, DIC_ISLAND_SEASON
+from module.island_handler.milp import LinearConstraint, milp
 from module.island_handler.production_plan_calculator import (
     ProductionPlanCalculator,
+    extend_problem,
     get_current_activity_list,
+)
+from module.island_handler.production_planner import (
+    IslandProductionPlanner,
+    create_production_calculator,
+    create_production_problem,
+    load_planner_demands,
+)
+from module.island.utils import (
+    get_current_season_remaining_days,
+    get_stuck_season_order_remaining_days,
+    resolve_stuck_season_order_id,
 )
 
 EPS = 1e-4
@@ -23,6 +38,14 @@ class AllUnlockedTechnology(dict):
 
     def get(self, key, default=False):
         return True
+
+
+class FakePlannerConfig:
+    def __init__(self, values):
+        self.values = values
+
+    def cross_get(self, key, default=None):
+        return self.values.get(key, default)
 
 
 def make_calculator(technology_status=None, **kwargs):
@@ -84,9 +107,122 @@ class TestGetCurrentActivityList:
         end = datetime.strptime(season['end_time'][server.server], '%Y-%m-%d %H:%M:%S')
         midpoint = start + (end - start) / 2
         assert get_current_activity_list(midpoint) == season['activity']
+        assert get_current_season_remaining_days(midpoint) == pytest.approx(
+            (end - midpoint).total_seconds() / 86400
+        )
 
     def test_outside_all_seasons(self):
         assert get_current_activity_list(datetime(1970, 1, 1)) is None
+        assert get_current_season_remaining_days(datetime(1970, 1, 1)) is None
+
+    def test_stuck_order_uses_its_activity_deadline(self):
+        order_id = 100001
+        activity = DIC_ISLAND_ACTIVITY[990002]
+        start = datetime.strptime(activity['start_time'][server.server], '%Y-%m-%d %H:%M:%S')
+        end = datetime.strptime(activity['end_time'][server.server], '%Y-%m-%d %H:%M:%S')
+        midpoint = start + (end - start) / 2
+        assert get_stuck_season_order_remaining_days(order_id, midpoint) == pytest.approx(
+            (end - midpoint).total_seconds() / 86400
+        )
+
+    def test_stuck_order_resolves_repeated_requirements_to_active_activity(self):
+        old_order_id = 100015
+        current_order_id = 100060
+        activity = DIC_ISLAND_ACTIVITY[990023]
+        start = datetime.strptime(activity['start_time'][server.server], '%Y-%m-%d %H:%M:%S')
+        end = datetime.strptime(activity['end_time'][server.server], '%Y-%m-%d %H:%M:%S')
+        midpoint = start + (end - start) / 2
+        assert resolve_stuck_season_order_id(old_order_id, midpoint) == current_order_id
+        assert get_stuck_season_order_remaining_days(old_order_id, midpoint) == pytest.approx(
+            (end - midpoint).total_seconds() / 86400
+        )
+
+    def test_planner_run_replays_with_injected_current_time(self):
+        activity = DIC_ISLAND_ACTIVITY[990023]
+        start = datetime.strptime(activity['start_time'][server.server], '%Y-%m-%d %H:%M:%S')
+        end = datetime.strptime(activity['end_time'][server.server], '%Y-%m-%d %H:%M:%S')
+        current_time = start + (end - start) / 2
+        planner = object.__new__(IslandProductionPlanner)
+        planner.config = FakePlannerConfig({
+            'IslandProductionPlanner.IslandProductionPlanner.FieldsEfficiency': 0,
+            'IslandProductionPlanner.IslandProductionPlanner.OrchardEfficiency': 0,
+            'IslandProductionPlanner.IslandProductionPlanner.NurseryEfficiency': 0,
+        })
+
+        calculator = planner.run(
+            tech_status_yaml={},
+            hard_floor_items_yaml={},
+            task_target_items={2700: 100},
+            stuck_season_order_id=100015,
+            export=False,
+            current_time=current_time,
+        )
+
+        assert calculator.activity_list == get_current_activity_list(current_time)
+        assert calculator.task_target_items[2700]['period'] == pytest.approx(
+            get_current_season_remaining_days(current_time)
+        )
+        assert calculator.stuck_season_order_id == 100060
+        assert calculator.stuck_season_order_items[4011]['period'] == pytest.approx(
+            get_stuck_season_order_remaining_days(100015, current_time)
+        )
+
+
+class TestPlannerConfig:
+    @staticmethod
+    def season_midpoint():
+        activity = DIC_ISLAND_ACTIVITY[990023]
+        start = datetime.strptime(activity['start_time'][server.server], '%Y-%m-%d %H:%M:%S')
+        end = datetime.strptime(activity['end_time'][server.server], '%Y-%m-%d %H:%M:%S')
+        return start + (end - start) / 2
+
+    @staticmethod
+    def planner_config(**values):
+        config = {
+            'IslandProductionPlanner.IslandProductionPlanner.FieldsEfficiency': 0,
+            'IslandProductionPlanner.IslandProductionPlanner.OrchardEfficiency': 0,
+            'IslandProductionPlanner.IslandProductionPlanner.NurseryEfficiency': 0,
+            'IslandProductionPlanner.Storage.Storage.IslandTechnologyStatus': {},
+            'IslandSeasonTask.IslandSeasonTask.TaskTarget': '{2700: 100}',
+            'IslandOrder.IslandOrder.StuckSeasonOrderId': 100015,
+        }
+        config.update(values)
+        return FakePlannerConfig(config)
+
+    def test_load_planner_demands(self):
+        current_time = self.season_midpoint()
+        config = self.planner_config()
+        assert load_planner_demands(config, current_time) == {
+            'task_target_items': {2700: 100},
+            'task_target_period': get_current_season_remaining_days(current_time),
+            'stuck_season_order_id': 100015,
+            'current_time': current_time,
+        }
+        # Given values win over config
+        demands = load_planner_demands(config, current_time, task_target_items={}, stuck_season_order_id=0)
+        assert demands['task_target_items'] == {}
+        assert demands['stuck_season_order_id'] == 0
+
+    def test_create_production_problem_matches_planner_run(self):
+        current_time = self.season_midpoint()
+        config = self.planner_config()
+        planner = object.__new__(IslandProductionPlanner)
+        planner.config = config
+        solved = planner.run(hard_floor_items_yaml={}, export=False, current_time=current_time)
+
+        problem = create_production_problem(config, current_time)
+        assert problem['demand_items'] == solved.demand_items
+        assert problem['stuck_season_order_id'] == solved.stuck_season_order_id == 100060
+        result = milp(problem['c'], constraints=problem['constraints'], bounds=problem['bounds'])
+        rebuilt = create_production_calculator(config, {}, current_time)
+        rebuilt._apply_production_lp_result(result, problem)
+        assert rebuilt.lp_success
+        assert rebuilt.production_plan == pytest.approx(solved.production_plan)
+        assert rebuilt.net_items == pytest.approx(solved.net_items)
+
+    def test_create_production_problem_needs_saved_technology(self):
+        config = self.planner_config(**{'IslandProductionPlanner.Storage.Storage.IslandTechnologyStatus': None})
+        assert create_production_problem(config, self.season_midpoint()) is None
 
 
 class TestAnalyzeTechnologyStatus:
@@ -172,6 +308,8 @@ class TestRestaurantSettings:
         assert calc.restaurant_capacity[601] == 5  # bronze
         assert calc.restaurant_quantity[601] == 2
         assert calc.restaurant_sales_bonus[601] == 0
+        assert calc.restaurant_grade[601] == 'bronze'
+        assert calc.restaurant_waitress_slots[601] == ('none', 'none')
 
     def test_waitress_effects(self):
         calc = make_calculator({}, restaurant_settings={
@@ -183,6 +321,8 @@ class TestRestaurantSettings:
         assert calc.restaurant_quantity[601] == 3
         assert calc.restaurant_sales_bonus[601] == pytest.approx(0.10)
         assert calc.restaurant_enabled[601]
+        assert calc.restaurant_grade[601] == 'gold'
+        assert calc.restaurant_waitress_slots[601] == ('Chao_Ho', 'none')
         # Prinz_Eugen: +0 capacity, +10% sales
         assert calc.restaurant_capacity[603] == 6
         assert calc.restaurant_sales_bonus[603] == pytest.approx(0.10)
@@ -225,6 +365,80 @@ class TestHardFloorNormalization:
         assert calc._build_planner_hard_floor_items(None) == {}
 
 
+class TestRanchSecondProduct:
+    @staticmethod
+    def get_recipe_activity(calc, recipe_id):
+        problem = calc._build_production_problem()
+        return next(
+            activity for activity in problem['activities']
+            if activity['kind'] == 'recipe' and activity['id'] == recipe_id
+        )
+
+    def test_second_product_amortized_over_three_batches(self):
+        # 400001 unlocks ranch second products, 2 chicken levels triple a batch
+        calc = make_calculator({400001: True, 410301: True, 410302: True})
+        eggs = self.get_recipe_activity(calc, 101013)
+        assert eggs['inputs'] == {3000: 2 * 3}
+        assert eggs['outputs'][2601] == pytest.approx(5 * 3)
+        # 4 poultry per drop, one drop every 3 batches
+        assert eggs['outputs'][2602] == pytest.approx(4 * 3 / 3)
+
+    def test_no_second_product_without_technology(self):
+        calc = make_calculator({410301: True, 410302: True})
+        eggs = self.get_recipe_activity(calc, 101013)
+        assert 2602 not in eggs['outputs']
+
+
+FLOUR_ACTIVITY = {'kind': 'shop', 'id': 103004, 'group': None, 'workload': 0,
+                  'inputs': {2000: 6}, 'outputs': {3004: 1}}
+COW_FEED_ACTIVITY = {'kind': 'shop', 'id': 103002, 'group': None, 'workload': 0,
+                     'inputs': {2008: 30}, 'outputs': {3002: 10}}
+
+
+class TestConversionIdleRedirect:
+    def test_pt_neutral_shop_ids(self):
+        # Flour and chicken/pig feed keep PT, cow/sheep feed gain PT
+        assert ProductionPlanCalculator.PT_NEUTRAL_SHOP_IDS == {103000, 103001, 103004}
+
+    def test_idle_flour_exported_as_wheat(self):
+        calc = make_calculator({})
+        calc.net_idle_accumulating_items = {3004: 10, 2000: 5}
+        # 12 flour bought, 2 of them consumed, 10 left idle
+        ratios = calc._redirect_conversion_idle_accumulating_items([12], [FLOUR_ACTIVITY])
+        assert calc.net_idle_accumulating_items == {2000: pytest.approx(5 + 10 * 6)}
+        assert ratios == {0: pytest.approx(10 / 12)}
+
+    def test_pt_gaining_shop_conversion_kept(self):
+        calc = make_calculator({})
+        calc.net_idle_accumulating_items = {3002: 10}
+        ratios = calc._redirect_conversion_idle_accumulating_items([1], [COW_FEED_ACTIVITY])
+        assert calc.net_idle_accumulating_items == {3002: 10}
+        assert ratios == {}
+
+    def test_total_pt_counts_idle_fish_meat(self):
+        calc = make_calculator({})
+        # Exchange 1 yellowfin tuna per day into 18 saltwater fish meat, left idle
+        exchange = {'kind': 'exchange', 'id': 206, 'group': None, 'workload': 0,
+                    'inputs': {5107: 1}, 'outputs': {2522: 18}}
+        problem = {
+            'activities': [exchange], 'sale_entries': [], 'item_index': {5107: 0, 2522: 1},
+            'end_offset': 1, 'group_slots': {}, 'wild_gather_plan': {}, 'mining_supply_plan': {},
+            'logging_supply_plan': {}, 'demand_items': {}, 'hard_floor_items': {},
+            'task_target_items': {}, 'stuck_season_order_id': 0, 'stuck_season_order_items': {},
+        }
+        result = SimpleNamespace(status=0, success=True, message='', x=[1, 0, 18])
+        calc._apply_production_lp_result(result, problem)
+        assert calc.idle_accumulating_items_per_day == {5107: 1}
+        assert calc.total_pt == pytest.approx(18 * 48)
+
+    def test_idle_conversion_share_needs_no_buffer(self):
+        calc = make_calculator({})
+        kwargs = dict(solution=[12], activities=[FLOUR_ACTIVITY], sale_entries=[], activity_count=1)
+        assert calc._calculate_product_daily_buffer_items(**kwargs) == {2000: 72}
+        # 10 of 12 flour left idle, only the wheat of 2 flour is consumed daily
+        assert calc._calculate_product_daily_buffer_items(**kwargs, idle_ratios={0: 10 / 12}) == {2000: 12}
+
+
 class TestSolveBaseTechnology:
     def test_initial_state_before_solve(self):
         calc = make_calculator({})
@@ -232,14 +446,42 @@ class TestSolveBaseTechnology:
         assert calc.production_plan == {}
         assert calc.demand_items == {}
 
+    def test_scalar_task_target_requires_planning_period(self):
+        calc = make_calculator({})
+        with pytest.raises(ValueError, match='No planning period was provided'):
+            calc.solve_production_plan(task_target_items={2700: 100})
+
+    def test_scalar_stuck_order_requires_planning_period(self):
+        calc = make_calculator({})
+        with pytest.raises(ValueError, match='No planning period was provided'):
+            calc.solve_production_plan(
+                stuck_season_order_id=100015,
+                current_time=datetime(1970, 1, 1),
+            )
+
+    def test_stuck_order_uses_period_from_injected_current_time(self):
+        activity = DIC_ISLAND_ACTIVITY[990023]
+        end = datetime.strptime(activity['end_time'][server.server], '%Y-%m-%d %H:%M:%S')
+        calc = make_calculator({})
+        calc.solve_production_plan(
+            stuck_season_order_id=100015,
+            current_time=end - timedelta(days=20),
+        )
+        assert calc.stuck_season_order_id == 100060
+        assert calc.stuck_season_order_items[4011]['rate_per_day'] == pytest.approx(0.25)
+        assert calc.stuck_season_order_items[4013]['rate_per_day'] == pytest.approx(0.25)
+
     def test_demand_satisfied_and_invalid_stuck_order_ignored(self):
         calc = make_calculator({})
         # 2700 (stone) is passively supplied by mining: 9 sites x 8/day
-        calc.solve_production_plan(task_target_items={2700: 100}, stuck_season_order_id='abc')
+        calc.solve_production_plan(
+            task_target_items={2700: 100},
+            task_target_period=20,
+            stuck_season_order_id='abc',
+        )
         assert calc.lp_success
-        # 100 over default 10-day period -> 10 per day
-        assert calc.demand_items[2700]['rate_per_day'] == pytest.approx(10.0)
-        assert calc.net_items.get(2700, 0) >= 10 - EPS
+        assert calc.demand_items[2700]['rate_per_day'] == pytest.approx(5.0)
+        assert calc.net_items.get(2700, 0) >= 5 - EPS
         assert calc.mining_supply_plan == {2700: 72}
         assert calc.logging_supply_plan == {2800: 72}
         # Invalid stuck order id normalizes to no stuck demand
@@ -250,18 +492,67 @@ class TestSolveBaseTechnology:
         calc = make_calculator({})
         # 3054 (clock) needs locked manufacturing technology and has no
         # shop/exchange source, so its demand must be dropped, not kill the LP.
-        calc.solve_production_plan(task_target_items={3054: 5})
+        calc.solve_production_plan(task_target_items={3054: 5}, task_target_period=10)
         assert calc.lp_success
         assert 3054 not in calc.demand_items
 
     def test_impossible_demand_fails_with_empty_plans(self):
         calc = make_calculator({})
-        calc.solve_production_plan(task_target_items={2700: 10 ** 9})
+        calc.solve_production_plan(
+            task_target_items={2700: 10 ** 9},
+            task_target_period=10,
+        )
         assert not calc.lp_success
         assert calc.production_plan == {}
         assert calc.sell_plan == {}
         # Inputs are still recorded for reporting
         assert 2700 in calc.demand_items
+        failure_text = '\n'.join(calc.failure_diagnostics)
+        assert f'Demand bottleneck: {calc._item_name(2700)} (2700)' in failure_text
+        assert 'mining x72/day' in failure_text
+        report = calc.format_solved_production_plan()
+        assert '[restaurant_config]' in report
+        assert '[planning_failure]' in report
+
+    def test_impossible_recipe_demand_reports_saturated_production(self):
+        calc = make_calculator(
+            AllUnlockedTechnology(),
+            restaurant_settings={
+                601: {'grade': 'gold', 'waitress_slots': ('any', 'none')},
+            },
+        )
+        calc.solve_production_plan(
+            task_target_items={2000: 10 ** 6},
+            task_target_period=10,
+        )
+
+        assert not calc.lp_success
+        failure_text = '\n'.join(calc.failure_diagnostics)
+        assert f'Demand bottleneck: {calc._item_name(2000)} (2000)' in failure_text
+        assert 'Production bottleneck:' in failure_text
+        assert f'{calc._recipe_name(101001)} (101001)' in failure_text
+        assert 'Restaurant bottleneck:' in failure_text
+
+    def test_ranch_bottleneck_reports_daily_product_throughput(self):
+        calc = make_calculator({
+            310101: True,
+            420301: True,
+            420302: True,
+            500211: True,
+            500212: True,
+            540001: True,
+        }, restaurant_settings={
+            901: {'grade': 'bronze', 'waitress_slots': ('any', 'none')},
+        })
+        calc.solve_production_plan(
+            task_target_items={3029: 250},
+            task_target_period=10,
+        )
+
+        assert not calc.lp_success
+        failure_text = '\n'.join(calc.failure_diagnostics)
+        assert 'requires 25/day (250 in 10 day(s))' in failure_text
+        assert '鲜肉 (101015) x12 batches/day -> 鲜肉 (2600) x96/day' in failure_text
 
 
 class TestSolveAllTechnology:
@@ -296,6 +587,11 @@ class TestSolveAllTechnology:
         for plan in (calc.production_plan, calc.shop_plan, calc.exchange_plan, calc.sell_plan):
             assert all(amount > 0 for amount in plan.values())
 
+    def test_conversion_output_not_exported_as_idle(self, all_tech_koi_solved):
+        # Production cannot schedule flour, chicken/pig feed or fish meat
+        idle = set(all_tech_koi_solved.idle_accumulating_items_per_day)
+        assert not idle & {3000, 3001, 3004, 2521, 2522}
+
     def test_yaml_exports_parse(self, all_tech_koi_solved):
         calc = all_tech_koi_solved
         buffer_items = safe_load(calc.daily_buffer_items_to_yaml())
@@ -311,8 +607,13 @@ class TestSolveAllTechnology:
     def test_format_solved_production_plan(self, all_tech_koi_solved):
         text = all_tech_koi_solved.format_solved_production_plan()
         assert 'LP success: True' in text
-        for section in ['[production]', '[sell]', '[daily_buffer_items]']:
+        for section in ['[restaurant_config]', '[production]', '[sell]', '[daily_buffer_items]']:
             assert section in text
+        assert (
+            '(601): grade=gold, waitress_slots=[Chao_Ho, none], enabled=True'
+            in text
+        )
+        assert 'shelf_count=3, shelf_capacity=7, total_capacity=21/day, sales_bonus=10%' in text
 
 
 class TestDailyBufferSafetyMargin:
@@ -328,3 +629,99 @@ class TestDailyBufferSafetyMargin:
     def test_negative_margin_clamped(self):
         calc = make_calculator({}, daily_buffer_safety_margin=-5)
         assert calc.daily_buffer_safety_margin == 0
+
+
+class TestProblemBuilding:
+    STONE_BALANCE = ('item_balance', 2700)
+
+    def test_build_does_not_solve_and_matches_solve(self):
+        kwargs = {'task_target_items': {2700: 100}, 'task_target_period': 20}
+        solved = make_calculator({})
+        solved.solve_production_plan(**kwargs)
+        builder = make_calculator({})
+        problem = builder.build_production_problem(**kwargs)
+        assert builder.lp_status is None
+        assert builder.production_plan == {}
+        row = problem['constraint_labels'].index(('demand', 2700))
+        assert problem['constraints'].lb[row] == pytest.approx(5.0)
+
+        result = milp(problem['c'], constraints=problem['constraints'], bounds=problem['bounds'])
+        builder._apply_production_lp_result(result, problem)
+        assert builder.lp_success
+        assert builder.production_plan == pytest.approx(solved.production_plan)
+        assert builder.net_items == pytest.approx(solved.net_items)
+        assert builder.demand_items == solved.demand_items
+
+    def test_extend_appends_without_touching_original(self):
+        problem = make_calculator({}).build_production_problem()
+        n = len(problem['c'])
+        m = problem['constraints'].A.shape[0]
+        original_a = problem['constraints'].A.copy()
+        original_labels = list(problem['constraint_labels'])
+
+        extended = extend_problem(problem, columns=[
+            {'label': 'extra_stone', 'cost': -1, 'ub': 10, 'rows': {self.STONE_BALANCE: 1}},
+            {'label': 'allow', 'ub': 1, 'integer': True},
+        ], rows=[
+            {'label': 'gate', 'columns': {'extra_stone': 1, 'allow': -10}, 'ub': 0},
+        ])
+        assert extended['constraints'].A.shape == (m + 1, n + 2)
+        assert extended['constraint_labels'] == original_labels + ['gate']
+        assert extended['column_labels'] == {'extra_stone': n, 'allow': n + 1}
+        assert extended['constraints'].A[original_labels.index(self.STONE_BALANCE), n] == 1
+        assert list(extended['constraints'].A[m, n:]) == [1, -10]
+        assert list(extended['c'][n:]) == [-1, 0]
+        assert list(extended['integrality']) == [0] * n + [0, 1]
+        assert list(extended['bounds'].ub[n:]) == [10, 1]
+        np.testing.assert_array_equal(extended['constraints'].A[:m, :n], original_a)
+        # The input problem is not modified
+        assert problem['constraints'].A.shape == (m, n)
+        np.testing.assert_array_equal(problem['constraints'].A, original_a)
+        assert problem['constraint_labels'] == original_labels
+        assert 'column_labels' not in problem and 'integrality' not in problem
+
+        twice = extend_problem(extended, columns=[{'label': 'more', 'integer': True}],
+                               rows=[{'label': 'cap', 'columns': {'more': 1, n: 1}, 'ub': 5}])
+        assert twice['column_labels'] == {'extra_stone': n, 'allow': n + 1, 'more': n + 2}
+        assert list(twice['integrality'][n:]) == [0, 1, 1]
+        assert twice['constraints'].A[m + 1, n] == 1
+
+    def test_column_on_balance_row_acts_as_supply(self):
+        problem = make_calculator({}).build_production_problem()
+        extended = extend_problem(problem, columns=[
+            {'label': 'extra_stone', 'ub': 10, 'rows': {self.STONE_BALANCE: 1}},
+            {'label': 'allow', 'cost': 1e-3, 'ub': 1, 'integer': True},
+        ], rows=[
+            {'label': 'gate', 'columns': {'extra_stone': 1, 'allow': -10}, 'ub': 0},
+        ])
+        result = milp(extended['c'], integrality=extended['integrality'],
+                      constraints=extended['constraints'], bounds=extended['bounds'])
+        assert result.success
+        stone = result.x[extended['column_labels']['extra_stone']]
+        allow = result.x[extended['column_labels']['allow']]
+        # Extra stone is worth at least its pt_num, more than the gate cost
+        assert allow == pytest.approx(1)
+        assert stone == pytest.approx(10)
+
+        # Same optimum as raising the stone supply of the original problem by 10
+        row = problem['constraint_labels'].index(self.STONE_BALANCE)
+        lb = problem['constraints'].lb.copy()
+        ub = problem['constraints'].ub.copy()
+        lb[row] -= stone
+        ub[row] -= stone
+        shifted = milp(problem['c'], constraints=LinearConstraint(problem['constraints'].A, lb, ub),
+                       bounds=problem['bounds'])
+        assert shifted.fun == pytest.approx(result.fun - 1e-3 * allow, abs=1e-6)
+        base = milp(problem['c'], constraints=problem['constraints'], bounds=problem['bounds'])
+        assert base.fun - shifted.fun >= 10 * DIC_ISLAND_ITEM[2700]['pt_num'] - EPS
+
+    def test_extend_rejects_bad_labels(self):
+        problem = make_calculator({}).build_production_problem()
+        with pytest.raises(ValueError):
+            extend_problem(problem, rows=[{'label': self.STONE_BALANCE, 'columns': {}}])
+        with pytest.raises(ValueError):
+            extend_problem(problem, columns=[{'label': 3}])
+        with pytest.raises(ValueError):
+            extend_problem(problem, columns=[{'label': 'a'}, {'label': 'a'}])
+        with pytest.raises(KeyError):
+            extend_problem(problem, columns=[{'label': 'a', 'rows': {('item_balance', -1): 1}}])
